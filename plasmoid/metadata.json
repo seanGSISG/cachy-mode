@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [{ "Name": "Sean Swanson" }],
+        "Category": "System Information",
+        "Description": "Switch cachy between Gaming and Dev/AI modes",
+        "Icon": "input-gaming",
+        "Id": "me.lsdmt.cachymode",
+        "License": "MIT",
+        "Name": "Cachy Mode",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

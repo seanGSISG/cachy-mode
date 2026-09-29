@@ -1,0 +1,7 @@
+# ~/.config/cachy-mode/config — sourced by cachy-mode (bash syntax). All optional.
+
+# systemd --user units to stop in Gaming mode and bring back in Dev mode.
+UNITS=(comfyui comfyui-mcp)
+
+# If ComfyUI answers here, Gaming mode refuses while its queue has jobs (use --force / the widget's Force).
+COMFY_URL="http://127.0.0.1:8188"

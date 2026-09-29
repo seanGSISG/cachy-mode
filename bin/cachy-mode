@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# cachy-mode — flip the box between GAMING (V-cache CCD, performance profile,
+# GPU-heavy user units stopped) and DEV (frequency CCD, balanced, those units
+# restored the way systemd autostart has them).
+# Used by the Plasma widget, the auto-switch watcher, and humans.
+set -euo pipefail
+
+self=$(readlink -f "$0")
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cachy-mode"
+STEAM_APPS="$HOME/.local/share/Steam/steamapps"
+AUTO_UNIT="cachy-mode-auto.service"
+
+# Overridable in ~/.config/cachy-mode/config (sourced as bash):
+UNITS=()                             # systemd --user units stopped for gaming
+COMFY_URL="http://127.0.0.1:8188"    # ComfyUI queue guard; harmless if nothing listens
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cachy-mode/config"
+# shellcheck source=/dev/null
+[[ -f $CONFIG ]] && source "$CONFIG"
+
+mkdir -p "$STATE_DIR"
+
+x3d_path() { compgen -G '/sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode' | head -1 || true; }
+get() { cat "$STATE_DIR/$1" 2>/dev/null || true; }
+put() { printf '%s\n' "$2" >"$STATE_DIR/$1.tmp" && mv "$STATE_DIR/$1.tmp" "$STATE_DIR/$1"; }
+notify() { notify-send -a "Cachy Mode" -i "$1" "$2" "${3:-}" 2>/dev/null || true; }
+log() { echo "cachy-mode: $*" >&2; }
+
+current_mode() {
+  local m; m=$(get mode)
+  if [[ -z $m ]]; then # first run: infer from the CCD preference
+    local p; p=$(x3d_path); [[ -n $p && $(cat "$p") == cache ]] && m=gaming || m=dev
+  fi
+  echo "$m"
+}
+
+set_x3d() {
+  local p; p=$(x3d_path)
+  [[ -n $p ]] || { log "no amd_x3d_vcache driver"; return 0; }
+  echo "$1" | sudo -n tee "$p" >/dev/null || log "could not set x3d mode $1"
+}
+
+comfy_queue() { # running+pending jobs; 0 if ComfyUI is down
+  curl -sf -m 1 "$COMFY_URL/queue" 2>/dev/null \
+    | jq '(.queue_running|length)+(.queue_pending|length)' 2>/dev/null || echo 0
+}
+
+running_game() { # prints "appid|name" of a running Steam game, or nothing
+  local id name=""
+  id=$(pgrep -af 'SteamLaunch AppId=' 2>/dev/null | grep -oP 'AppId=\K[0-9]+' | head -1) || true
+  [[ -n $id ]] || return 0
+  [[ -f $STEAM_APPS/appmanifest_$id.acf ]] &&
+    name=$(grep -oP '^\s*"name"\s*"\K[^"]+' "$STEAM_APPS/appmanifest_$id.acf" | head -1)
+  echo "$id|${name:-App $id}"
+}
+
+lock() { exec 9>"$STATE_DIR/lock"; flock -w 120 9 || { log "another switch is running"; exit 4; }; }
+
+cmd_gaming() {
+  local force=0 auto=0
+  for a in "$@"; do case $a in --force) force=1 ;; --auto) auto=1 ;; esac; done
+  lock
+  local q; q=$(comfy_queue)
+  if (( q > 0 && ! force )); then
+    notify dialog-warning "Gaming mode blocked" "ComfyUI has $q job(s) queued. Use Force to stop it anyway."
+    exit 3
+  fi
+  if [[ $(current_mode) != gaming ]]; then # remember what to bring back
+    local up=() u
+    for u in "${UNITS[@]}"; do systemctl --user is-active --quiet "$u" && up+=("$u"); done
+    put restore "${up[*]}"
+  fi
+  (( ${#UNITS[@]} == 0 )) || systemctl --user stop "${UNITS[@]}" || log "failed to stop ${UNITS[*]}"
+  set_x3d cache
+  powerprofilesctl set performance 2>/dev/null || log "power profile unchanged"
+  put mode gaming; put auto_trigger "$auto"
+  notify input-gaming "Gaming mode" "V-cache CCD · performance${UNITS[*]:+ · stopped ${UNITS[*]}}"
+}
+
+cmd_dev() {
+  lock
+  set_x3d frequency
+  powerprofilesctl set balanced 2>/dev/null || log "power profile unchanged"
+  local want u; want=$(get restore)
+  if [[ -z $want ]]; then # nothing recorded: do what autostart would
+    for u in "${UNITS[@]}"; do systemctl --user is-enabled --quiet "$u" && want+=" $u"; done
+  fi
+  # shellcheck disable=SC2086
+  [[ -z ${want// } ]] || systemctl --user start $want || log "failed to start $want"
+  put mode dev; put auto_trigger 0
+  local msg="Frequency CCD · balanced"; [[ -z ${want// } ]] || msg+=" · restored ${want# }"
+  notify applications-development "Dev mode" "$msg"
+}
+
+cmd_status() {
+  local p x3d="n/a" prof gpu used=0 total=0 temp=0 util=0 power=0 procs svc="[]" u
+  p=$(x3d_path); [[ -n $p ]] && x3d=$(cat "$p")
+  prof=$(powerprofilesctl get 2>/dev/null || echo unknown)
+  if gpu=$(nvidia-smi --query-gpu=memory.used,memory.total,temperature.gpu,utilization.gpu,power.draw \
+             --format=csv,noheader,nounits 2>/dev/null); then
+    IFS=', ' read -r used total temp util power <<<"$gpu"
+    [[ $power =~ ^[0-9] ]] || power=0
+  fi
+  procs=$(nvidia-smi --query-compute-apps=process_name,used_memory --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', ' '{n=$1; if (tolower(n) ~ /comfy/) n="ComfyUI"; else { sub(/ .*/,"",n); sub(/.*\//,"",n) }
+        mb[n]+=$2} END {for (k in mb) print mb[k] "\t" k}' | sort -rn \
+    | jq -R 'split("\t") | {mb: (.[0]|tonumber), name: .[1]}' | jq -s .)
+  for u in "${UNITS[@]}"; do
+    svc=$(jq --arg n "$u" --argjson a "$(systemctl --user is-active --quiet "$u" && echo true || echo false)" \
+      '. + [{name:$n, active:$a}]' <<<"$svc")
+  done
+  local game; game=$(running_game)
+  jq -n \
+    --arg mode "$(current_mode)" --arg x3d "$x3d" --arg prof "$prof" \
+    --argjson auto "$(systemctl --user is-active --quiet "$AUTO_UNIT" && echo true || echo false)" \
+    --argjson autotrig "$( [[ $(get auto_trigger) == 1 ]] && echo true || echo false)" \
+    --argjson gpu "{\"used\":${used:-0},\"total\":${total:-0},\"temp\":${temp:-0},\"util\":${util:-0},\"power\":${power%.*}}" \
+    --argjson procs "${procs:-[]}" --argjson svc "$svc" \
+    --argjson queue "$(comfy_queue)" --arg game "$game" \
+    '{mode:$mode, auto:$auto, auto_triggered:$autotrig, x3d:$x3d, profile:$prof, gpu:$gpu,
+      vram:$procs, services:$svc, comfy_queue:$queue,
+      game:(if $game=="" then null else ($game|split("|")|{appid:.[0], name:.[1]}) end)}'
+}
+
+cmd_watch() { # auto-switch loop (run by cachy-mode-auto.service)
+  local gone=0 warned=""
+  while sleep 5; do
+    local g id; g=$(running_game); id=${g%%|*}
+    if [[ -n $g ]]; then
+      gone=0
+      if [[ $(current_mode) != gaming ]]; then
+        if (( $(comfy_queue) > 0 )); then # fail closed: never kill a render; retry every poll
+          [[ $warned == "$id" ]] || { notify dialog-warning "${g#*|} started" "ComfyUI is busy, so staying in Dev mode. Will switch when the queue drains."; warned=$id; }
+        else
+          log "game $g detected -> gaming"; "$self" gaming --auto || true; warned=""
+        fi
+      fi
+    elif [[ $(current_mode) == gaming && $(get auto_trigger) == 1 ]]; then
+      (( ++gone >= 3 )) && { log "game exited -> dev"; "$self" dev || true; gone=0; }
+    else
+      gone=0; warned=""
+    fi
+  done
+}
+
+case "${1:-status}" in
+  gaming)    shift; cmd_gaming "$@" ;;
+  dev)       cmd_dev ;;
+  status)    [[ ${2:-} == --json ]] && cmd_status || cmd_status | jq . ;;
+  watch)     cmd_watch ;;
+  auto)      case ${2:-} in
+               on)  systemctl --user enable --now "$AUTO_UNIT" ;;
+               off) systemctl --user disable --now "$AUTO_UNIT" ;;
+               *)   echo "usage: cachy-mode auto on|off" >&2; exit 2 ;;
+             esac ;;
+  *) echo "usage: cachy-mode {gaming [--force]|dev|status [--json]|auto on|off|watch}" >&2; exit 2 ;;
+esac

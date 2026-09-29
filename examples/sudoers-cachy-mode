@@ -1,0 +1,4 @@
+# /etc/sudoers.d/cachy-mode — lets cachy-mode flip the X3D V-cache preference without a password.
+# Install:  sudo install -m 0440 examples/sudoers-cachy-mode /etc/sudoers.d/cachy-mode && sudo visudo -c
+# Replace %wheel with your user or group if needed.
+%wheel ALL=(root) NOPASSWD: /usr/bin/tee /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode

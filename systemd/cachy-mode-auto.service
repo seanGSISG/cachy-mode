@@ -1,0 +1,11 @@
+[Unit]
+Description=cachy-mode auto-switch (Gaming while a Steam game runs)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/cachy-mode watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
