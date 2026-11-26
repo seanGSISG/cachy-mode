@@ -14,6 +14,11 @@ PlasmoidItem {
     property bool switching: false
     property string pending: ""          // mode being switched to, for instant UI feedback
     readonly property bool gaming: pending ? pending === "gaming" : st.mode === "gaming"
+    // Companion: null when not configured; a mode switch turns it off (gaming) or on (dev)
+    readonly property var companion: st.companion ?? null
+    property string companionPending: ""  // "on"/"off" while a manual toggle runs
+    readonly property bool companionOn: companionPending ? companionPending === "on"
+        : pending ? pending === "dev" : !!companion && companion.state === "on"
 
     // Mode palettes: gaming = violet→magenta, dev = sky→teal
     readonly property color accentA: gaming ? "#7c3aed" : "#0284c7"
@@ -41,6 +46,10 @@ PlasmoidItem {
     function gb(mb) { return (mb / 1024).toFixed(1) }
     function run(args) { exec.connectSource(`${cli} ${args}`) }
     function refresh() { run("status --json") }
+    function setCompanion(on) {
+        companionPending = on ? "on" : "off"
+        run("companion " + companionPending)
+    }
     function switchTo(mode, extra) {
         if (switching || (mode === st.mode && !extra)) return
         switching = true; pending = mode
@@ -54,6 +63,9 @@ PlasmoidItem {
             disconnectSource(source)
             if (source.endsWith("status --json")) {
                 try { root.st = JSON.parse(data.stdout) } catch (e) {}
+            } else if (source.includes(" companion ")) {
+                root.companionPending = ""
+                root.refresh()
             } else {
                 root.switching = false; root.pending = ""
                 root.refresh()
@@ -400,6 +412,39 @@ PlasmoidItem {
                                 opacity: 0.55
                                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                             }
+                        }
+                    }
+                }
+            }
+
+            // ── companion ──────────────────────────────────────────────
+            Tile {
+                Layout.fillWidth: true
+                visible: !!root.companion
+                implicitHeight: compRow.implicitHeight + Kirigami.Units.largeSpacing * 2
+                RowLayout {
+                    id: compRow
+                    anchors { fill: parent; margins: Kirigami.Units.largeSpacing }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        PlasmaComponents3.Label { text: "Companion"; font.weight: Font.DemiBold }
+                        PlasmaComponents3.Label {
+                            Layout.fillWidth: true
+                            readonly property string host: root.companion ? root.companion.host : ""
+                            text: root.companionPending ? (root.companionPending === "on" ? "Starting…" : "Stopping…")
+                                : root.companion && root.companion.state === "unknown" ? `${host} is unreachable`
+                                : `On ${host} · off in Gaming, on in Dev`
+                            wrapMode: Text.Wrap; opacity: 0.55
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        }
+                    }
+                    PlasmaComponents3.Switch {
+                        checked: root.companionOn
+                        enabled: !root.companionPending && !root.switching
+                        onToggled: {
+                            root.setCompanion(checked)
+                            checked = Qt.binding(() => root.companionOn)  // a click breaks the binding
                         }
                     }
                 }

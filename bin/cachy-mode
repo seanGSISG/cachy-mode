@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cachy-mode — flip the box between GAMING (V-cache CCD, performance profile,
-# GPU-heavy user units stopped) and DEV (frequency CCD, balanced, those units
-# restored the way systemd autostart has them).
+# GPU-heavy user units and the companion stopped) and DEV (frequency CCD,
+# balanced, those units and the companion started).
 # Used by the Plasma widget, the auto-switch watcher, and humans.
 set -euo pipefail
 
@@ -11,7 +11,9 @@ STEAM_APPS="$HOME/.local/share/Steam/steamapps"
 AUTO_UNIT="cachy-mode-auto.service"
 
 # Overridable in ~/.config/cachy-mode/config (sourced as bash):
-UNITS=()                             # systemd --user units stopped for gaming
+UNITS=()                             # systemd --user units stopped for gaming, started for dev
+COMPANION_HOST=""                    # ssh host of a remote Compose app that uses this GPU; empty = none
+COMPANION_DIR=""                     # its Compose project directory on that host
 COMFY_URL="http://127.0.0.1:8188"    # ComfyUI queue guard; harmless if nothing listens
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cachy-mode/config"
 # shellcheck source=/dev/null
@@ -53,6 +55,38 @@ running_game() { # prints "appid|name" of a running Steam game, or nothing
   echo "$id|${name:-App $id}"
 }
 
+# ── companion: a remote Docker Compose app, off in Gaming, on in Dev ──────
+companion_compose() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$COMPANION_HOST" "cd $COMPANION_DIR && docker compose $*"; }
+
+companion_probe() { # refresh the cached state: on | off | unknown (unreachable)
+  local out
+  if out=$(companion_compose ps -q --status running 2>/dev/null); then
+    put companion "$([[ -n $out ]] && echo on || echo off)"
+  else
+    put companion unknown
+  fi
+}
+
+companion_set() { # on|off; returns 0 when no companion is configured
+  [[ -n $COMPANION_HOST ]] || return 0
+  local verb=stop; [[ $1 == on ]] && verb="up -d"
+  if companion_compose "$verb" >/dev/null 2>&1; then
+    put companion "$1"
+  else
+    log "companion $1 failed on $COMPANION_HOST"; put companion unknown; return 1
+  fi
+}
+
+companion_json() { # cached state for status; refreshes in the background when older than 30 s
+  [[ -n $COMPANION_HOST ]] || { echo null; return; }
+  local f="$STATE_DIR/companion"
+  if [[ ! -f $f ]] || (( $(date +%s) - $(stat -c %Y "$f") >= 30 )); then
+    touch "$f"  # mark fresh first, so polls do not stack probes
+    companion_probe >/dev/null 2>&1 &
+  fi
+  jq -n --arg s "$(get companion)" --arg h "$COMPANION_HOST" '{state:($s|select(.!="")//"unknown"), host:$h}'
+}
+
 lock() { exec 9>"$STATE_DIR/lock"; flock -w 120 9 || { log "another switch is running"; exit 4; }; }
 
 cmd_gaming() {
@@ -64,31 +98,22 @@ cmd_gaming() {
     notify dialog-warning "Gaming mode blocked" "ComfyUI has $q job(s) queued. Use Force to stop it anyway."
     exit 3
   fi
-  if [[ $(current_mode) != gaming ]]; then # remember what to bring back
-    local up=() u
-    for u in "${UNITS[@]}"; do systemctl --user is-active --quiet "$u" && up+=("$u"); done
-    put restore "${up[*]}"
-  fi
+  companion_set off || true # first, so it stops sending jobs to ComfyUI
   (( ${#UNITS[@]} == 0 )) || systemctl --user stop "${UNITS[@]}" || log "failed to stop ${UNITS[*]}"
   set_x3d cache
   powerprofilesctl set performance 2>/dev/null || log "power profile unchanged"
   put mode gaming; put auto_trigger "$auto"
-  notify input-gaming "Gaming mode" "V-cache CCD · performance${UNITS[*]:+ · stopped ${UNITS[*]}}"
+  notify input-gaming "Gaming mode" "V-cache CCD · performance${UNITS[*]:+ · stopped ${UNITS[*]}}${COMPANION_HOST:+ · companion off}"
 }
 
 cmd_dev() {
   lock
   set_x3d frequency
   powerprofilesctl set balanced 2>/dev/null || log "power profile unchanged"
-  local want u; want=$(get restore)
-  if [[ -z $want ]]; then # nothing recorded: do what autostart would
-    for u in "${UNITS[@]}"; do systemctl --user is-enabled --quiet "$u" && want+=" $u"; done
-  fi
-  # shellcheck disable=SC2086
-  [[ -z ${want// } ]] || systemctl --user start $want || log "failed to start $want"
+  (( ${#UNITS[@]} == 0 )) || systemctl --user start "${UNITS[@]}" || log "failed to start ${UNITS[*]}"
+  companion_set on || true
   put mode dev; put auto_trigger 0
-  local msg="Frequency CCD · balanced"; [[ -z ${want// } ]] || msg+=" · restored ${want# }"
-  notify applications-development "Dev mode" "$msg"
+  notify applications-development "Dev mode" "Frequency CCD · balanced${UNITS[*]:+ · started ${UNITS[*]}}${COMPANION_HOST:+ · companion on}"
 }
 
 cmd_status() {
@@ -115,9 +140,9 @@ cmd_status() {
     --argjson autotrig "$( [[ $(get auto_trigger) == 1 ]] && echo true || echo false)" \
     --argjson gpu "{\"used\":${used:-0},\"total\":${total:-0},\"temp\":${temp:-0},\"util\":${util:-0},\"power\":${power%.*}}" \
     --argjson procs "${procs:-[]}" --argjson svc "$svc" \
-    --argjson queue "$(comfy_queue)" --arg game "$game" \
+    --argjson queue "$(comfy_queue)" --arg game "$game" --argjson companion "$(companion_json)" \
     '{mode:$mode, auto:$auto, auto_triggered:$autotrig, x3d:$x3d, profile:$prof, gpu:$gpu,
-      vram:$procs, services:$svc, comfy_queue:$queue,
+      vram:$procs, services:$svc, comfy_queue:$queue, companion:$companion,
       game:(if $game=="" then null else ($game|split("|")|{appid:.[0], name:.[1]}) end)}'
 }
 
@@ -147,10 +172,16 @@ case "${1:-status}" in
   dev)       cmd_dev ;;
   status)    [[ ${2:-} == --json ]] && cmd_status || cmd_status | jq . ;;
   watch)     cmd_watch ;;
+  companion) [[ -n $COMPANION_HOST ]] || { echo "cachy-mode: COMPANION_HOST is not set in $CONFIG" >&2; exit 2; }
+             case ${2:-status} in
+               on|off) companion_set "$2" ;;
+               status) companion_probe; get companion ;;
+               *)      echo "usage: cachy-mode companion on|off|status" >&2; exit 2 ;;
+             esac ;;
   auto)      case ${2:-} in
                on)  systemctl --user enable --now "$AUTO_UNIT" ;;
                off) systemctl --user disable --now "$AUTO_UNIT" ;;
                *)   echo "usage: cachy-mode auto on|off" >&2; exit 2 ;;
              esac ;;
-  *) echo "usage: cachy-mode {gaming [--force]|dev|status [--json]|auto on|off|watch}" >&2; exit 2 ;;
+  *) echo "usage: cachy-mode {gaming [--force]|dev|status [--json]|auto on|off|companion on|off|status|watch}" >&2; exit 2 ;;
 esac

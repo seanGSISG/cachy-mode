@@ -13,10 +13,13 @@ with ComfyUI or local LLM servers also needs its VRAM freed before a heavy game.
 |---|---|---|
 | `amd_x3d_mode` | `cache` (V-cache CCD) | `frequency` |
 | Power profile | performance | balanced |
-| Your GPU services (systemd user units) | stopped | restored to what was running before |
+| Your GPU services (systemd user units) | stopped | started |
+| Companion (optional remote Compose app) | stopped | started |
 
 - **Auto-switch** (optional): switches to Gaming while a Steam game runs and back when it exits.
   It only reverts switches it made itself.
+- **Companion** (optional): a Docker Compose app on another host that uses this GPU (for example a bot that
+  sends ComfyUI jobs). It follows the mode, and the widget has a switch to turn it on or off by hand.
 - **Fails closed:** Gaming mode refuses while ComfyUI has queued jobs. The widget offers **Force** for that case.
 - **Live stats:** VRAM ring and per-process breakdown, plus GPU temperature, power and load (via `nvidia-smi`).
 
@@ -52,6 +55,7 @@ cachy-mode gaming [--force]   # switch to Gaming
 cachy-mode dev                # switch to Dev
 cachy-mode status [--json]    # what the widget reads
 cachy-mode auto on|off        # Steam auto-switch (cachy-mode-auto.service)
+cachy-mode companion on|off|status  # the remote Compose app (COMPANION_HOST in the config)
 ```
 
 State lives in `~/.local/state/cachy-mode/`. Re-run `./install.sh` to upgrade.
