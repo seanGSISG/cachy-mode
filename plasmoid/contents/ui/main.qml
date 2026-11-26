@@ -433,7 +433,7 @@ PlasmoidItem {
                             Layout.fillWidth: true
                             readonly property string host: root.companion ? root.companion.host : ""
                             text: root.companionPending ? (root.companionPending === "on" ? "Starting…" : "Stopping…")
-                                : root.companion && root.companion.state === "unknown" ? `${host} is unreachable`
+                                : root.companion && root.companion.state === "unknown" ? `No status from ${host}`
                                 : `On ${host} · off in Gaming, on in Dev`
                             wrapMode: Text.Wrap; opacity: 0.55
                             font.pixelSize: Kirigami.Theme.smallFont.pixelSize

@@ -56,19 +56,21 @@ running_game() { # prints "appid|name" of a running Steam game, or nothing
 }
 
 # ── companion: a remote Docker Compose app, off in Gaming, on in Dev ──────
-companion_compose() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$COMPANION_HOST" "cd $COMPANION_DIR && docker compose $*"; }
-
-companion_probe() { # refresh the cached state: on | off | unknown (unreachable)
-  local out
-  if out=$(companion_compose ps -q --status running 2>/dev/null); then
-    put companion "$([[ -n $out ]] && echo on || echo off)"
-  else
-    put companion unknown
-  fi
+companion_enabled() { [[ -n $COMPANION_HOST && -n $COMPANION_DIR ]]; }
+companion_compose() { # COMPANION_DIR stays unquoted so a leading ~/ expands on the remote host
+  timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=5 "$COMPANION_HOST" "cd $COMPANION_DIR && docker compose $*"
 }
 
-companion_set() { # on|off; returns 0 when no companion is configured
-  [[ -n $COMPANION_HOST ]] || return 0
+companion_probe() { # refresh the cached state: on | off | unknown; a toggle that lands meanwhile wins
+  local f="$STATE_DIR/companion" ino out s=unknown
+  ino=$(stat -c %i "$f" 2>/dev/null || true) # put() replaces the file, so a new inode = newer state
+  if out=$(companion_compose ps -q --status running 2>/dev/null); then
+    s=$([[ -n $out ]] && echo on || echo off)
+  fi
+  if [[ $(stat -c %i "$f" 2>/dev/null || true) == "$ino" ]]; then put companion "$s"; fi
+}
+
+companion_set() { # on|off
   local verb=stop; [[ $1 == on ]] && verb="up -d"
   if companion_compose "$verb" >/dev/null 2>&1; then
     put companion "$1"
@@ -77,8 +79,13 @@ companion_set() { # on|off; returns 0 when no companion is configured
   fi
 }
 
+companion_note() { # on|off for a mode switch; prints the notification suffix
+  companion_enabled || return 0
+  if companion_set "$1"; then echo " · companion $1"; else echo " · companion $1 FAILED"; fi
+}
+
 companion_json() { # cached state for status; refreshes in the background when older than 30 s
-  [[ -n $COMPANION_HOST ]] || { echo null; return; }
+  companion_enabled || { echo null; return; }
   local f="$STATE_DIR/companion"
   if [[ ! -f $f ]] || (( $(date +%s) - $(stat -c %Y "$f") >= 30 )); then
     touch "$f"  # mark fresh first, so polls do not stack probes
@@ -93,17 +100,19 @@ cmd_gaming() {
   local force=0 auto=0
   for a in "$@"; do case $a in --force) force=1 ;; --auto) auto=1 ;; esac; done
   lock
-  local q; q=$(comfy_queue)
+  local was comp q; was=$(get companion)
+  comp=$(companion_note off) # before the queue check, so it cannot queue a job after it
+  q=$(comfy_queue)
   if (( q > 0 && ! force )); then
+    [[ $was != on ]] || companion_set on || true
     notify dialog-warning "Gaming mode blocked" "ComfyUI has $q job(s) queued. Use Force to stop it anyway."
     exit 3
   fi
-  companion_set off || true # first, so it stops sending jobs to ComfyUI
   (( ${#UNITS[@]} == 0 )) || systemctl --user stop "${UNITS[@]}" || log "failed to stop ${UNITS[*]}"
   set_x3d cache
   powerprofilesctl set performance 2>/dev/null || log "power profile unchanged"
   put mode gaming; put auto_trigger "$auto"
-  notify input-gaming "Gaming mode" "V-cache CCD · performance${UNITS[*]:+ · stopped ${UNITS[*]}}${COMPANION_HOST:+ · companion off}"
+  notify input-gaming "Gaming mode" "V-cache CCD · performance${UNITS[*]:+ · stopped ${UNITS[*]}}$comp"
 }
 
 cmd_dev() {
@@ -111,9 +120,9 @@ cmd_dev() {
   set_x3d frequency
   powerprofilesctl set balanced 2>/dev/null || log "power profile unchanged"
   (( ${#UNITS[@]} == 0 )) || systemctl --user start "${UNITS[@]}" || log "failed to start ${UNITS[*]}"
-  companion_set on || true
+  local comp; comp=$(companion_note on)
   put mode dev; put auto_trigger 0
-  notify applications-development "Dev mode" "Frequency CCD · balanced${UNITS[*]:+ · started ${UNITS[*]}}${COMPANION_HOST:+ · companion on}"
+  notify applications-development "Dev mode" "Frequency CCD · balanced${UNITS[*]:+ · started ${UNITS[*]}}$comp"
 }
 
 cmd_status() {
@@ -172,9 +181,9 @@ case "${1:-status}" in
   dev)       cmd_dev ;;
   status)    [[ ${2:-} == --json ]] && cmd_status || cmd_status | jq . ;;
   watch)     cmd_watch ;;
-  companion) [[ -n $COMPANION_HOST ]] || { echo "cachy-mode: COMPANION_HOST is not set in $CONFIG" >&2; exit 2; }
+  companion) companion_enabled || { echo "cachy-mode: set COMPANION_HOST and COMPANION_DIR in $CONFIG" >&2; exit 2; }
              case ${2:-status} in
-               on|off) companion_set "$2" ;;
+               on|off) lock; companion_set "$2" ;;
                status) companion_probe; get companion ;;
                *)      echo "usage: cachy-mode companion on|off|status" >&2; exit 2 ;;
              esac ;;
