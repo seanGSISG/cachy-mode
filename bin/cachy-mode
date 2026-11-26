@@ -100,7 +100,8 @@ cmd_gaming() {
   local force=0 auto=0
   for a in "$@"; do case $a in --force) force=1 ;; --auto) auto=1 ;; esac; done
   lock
-  local was comp q; was=$(get companion)
+  local was comp q
+  if companion_enabled; then companion_probe; fi; was=$(get companion) # live state, for a blocked switch
   comp=$(companion_note off) # before the queue check, so it cannot queue a job after it
   q=$(comfy_queue)
   if (( q > 0 && ! force )); then
@@ -119,10 +120,14 @@ cmd_dev() {
   lock
   set_x3d frequency
   powerprofilesctl set balanced 2>/dev/null || log "power profile unchanged"
-  (( ${#UNITS[@]} == 0 )) || systemctl --user start "${UNITS[@]}" || log "failed to start ${UNITS[*]}"
-  local comp; comp=$(companion_note on)
+  local units="" comp
+  if (( ${#UNITS[@]} )); then
+    units=" · started ${UNITS[*]}"
+    systemctl --user start "${UNITS[@]}" || { log "failed to start ${UNITS[*]}"; units=" · start FAILED ${UNITS[*]}"; }
+  fi
+  comp=$(companion_note on)
   put mode dev; put auto_trigger 0
-  notify applications-development "Dev mode" "Frequency CCD · balanced${UNITS[*]:+ · started ${UNITS[*]}}$comp"
+  notify applications-development "Dev mode" "Frequency CCD · balanced$units$comp"
 }
 
 cmd_status() {
